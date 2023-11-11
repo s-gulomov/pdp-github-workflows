@@ -8,7 +8,7 @@ docker build -f Dockerfile -t ghcr.io/s-gulomov/pdp-python-3.11/pdp-python-3.11:
 
 # Login to GitHub Container Registry
 export CR_PAT=$YOUR_TOKEN
-echo $CR_PAT | docker login ghcr.io -u trm-build-bot --password-stdin
+echo $CR_PAT | docker login ghcr.io -u pdp-build-bot --password-stdin
 
 # Push Docker Image
 docker push ghcr.io/s-gulomov/pdp-python-3.11/pdp-python-3.11:$IMAGE_VERSION
