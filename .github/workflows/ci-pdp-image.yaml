@@ -1,0 +1,250 @@
+name: Continious Integrations, Release, Publish Airflow image.
+#this workflow is used by https://github.com/vertexinc/trm-ps-web-crawler and https://github.com/vertexinc/trm-ps-kraken-service too
+
+on:
+  workflow_call:
+    inputs:
+      # Different applications depend on different version of python build image.
+      python-build-image:
+        type: string
+        description: Container name to run make targets.
+        required: true
+    outputs:
+      app-release-version:
+        description: "Release version for App"
+        value: ${{ jobs.release_image.outputs.app-release-version }}
+
+env:
+  AWS_DEFAULT_REGION: us-east-2
+  GITHUB_USERNAME: trm-build-bot
+  GITHUB_EMAIL: trm-build-bot@vertexinc.com
+  CONTAINER_REGISTRY: ghcr.io
+
+jobs:
+  release_image:
+    runs-on: [self-hosted, ec2, devops]
+
+    outputs:
+      app-release-version: ${{ steps.app-release-version.outputs.version }}
+
+    steps:
+      - name: Create unique working directory
+        shell: bash
+        id: create_workdir
+        run: |
+          JOB_WORKDIR="${{ github.workspace }}/run_id_${{ github.run_id }}/attempt_${{ github.run_attempt }}/$(echo $RANDOM)"
+          mkdir -p $JOB_WORKDIR
+          echo "path=$JOB_WORKDIR" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          path: "${{ steps.create_workdir.outputs.path }}"
+
+      - name: Login to GitHub Docker registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.CONTAINER_REGISTRY }}
+          username: ${{ env.GITHUB_USERNAME }}
+          password: ${{ secrets.TRM_GITHUB_BOT_TOKEN }}
+
+      # This is a steps in a GitHub Actions workflow, which makes use of Docker and a Makefiles.
+      # docker run --rm -t \ runs a Docker command, creating a new container with the provided specifications.
+      # The --rm flag automatically removes the containers and volumes when it exits.
+      # The -t flag allocates a pseudo-TTY, which can make the output more interactive, as if it's attached to a terminal.
+      # -v "$(pwd):/build" \ is a volume specification that binds the current directory our ($(pwd)) on the host to the /build directory in the container.
+      # This allows workdir to be shared between the host and the container.
+      # The -c "cd /build && make [Target]" is the command run in the container.
+      # This tells the sh shell to navigate (cd) to the /build directory (which should contain your project files due to the volume binding above) and then execute make venv.
+      # The make [Target] command assumes there's a Makefile in your project with a defined targets like this:
+      # https://github.com/vertexinc/trm-df-email-pipeline/blob/main/Makefile
+
+      - name: Configure AWS Credentials
+        id: creds
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: arn:aws:iam::343443274786:role/devops-trm-vcms-service-role-us-east-2
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 3600
+          role-session-name: CiAirflowImage
+          output-credentials: true
+
+      - name: Run make bump-release
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        run: |
+          docker run --rm -t \
+            -v "$(pwd):/build" \
+            -e AWS_DEFAULT_REGION=${{ env.AWS_DEFAULT_REGION }} \
+            -e AWS_ACCESS_KEY_ID=${{ steps.creds.outputs.aws-access-key-id }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ steps.creds.outputs.aws-secret-access-key }} \
+            -e AWS_SESSION_TOKEN=${{ steps.creds.outputs.aws-session-token }} \
+            --entrypoint sh ${{ inputs.python-build-image }} \
+            -c "cd /build && make bump-release"
+
+      - name: Run make build
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        run: |
+          docker run --rm -t \
+            -v "$(pwd):/build" \
+            -e AWS_DEFAULT_REGION=${{ env.AWS_DEFAULT_REGION }} \
+            -e AWS_ACCESS_KEY_ID=${{ steps.creds.outputs.aws-access-key-id }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ steps.creds.outputs.aws-secret-access-key }} \
+            -e AWS_SESSION_TOKEN=${{ steps.creds.outputs.aws-session-token }} \
+            --entrypoint sh ${{ inputs.python-build-image }} \
+            -c "cd /build && make build"
+
+      - name: Get current release-version
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        id: app-release-version
+        run: echo version=$(cat VERSION) >> $GITHUB_OUTPUT
+
+      - name: Repository name
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        id: repo_name
+        run: echo repo_name=$(echo ${{ github.repository }} | awk  -F/ '{ print $NF }') >> $GITHUB_OUTPUT
+
+      - name: Build release image
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        run: docker build --file Dockerfile --tag ${{ env.CONTAINER_REGISTRY }}/${{ github.repository }}/${{ steps.repo_name.outputs.repo_name }}:${{ steps.app-release-version.outputs.version }} .
+
+      - name: Push image to the GitHub Docker Registry
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        id: release_image
+        run: docker push ${{ env.CONTAINER_REGISTRY }}/${{ github.repository }}/${{ steps.repo_name.outputs.repo_name }}:${{ steps.app-release-version.outputs.version }}
+
+      # Release and build github changelog
+
+      - name: Get the last repository release tag
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        id: previos_tag
+        run: echo previos_tag=$(git describe --tags --abbrev=0) >> $GITHUB_OUTPUT
+
+      - name: Commit and push a new release version
+        uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          repository: ${{ steps.create_workdir.outputs.path }}
+          commit_message: Version in the VERSION, .bumpversion.cfg increased to v${{ steps.app-release-version.outputs.version }}  [skip ci]
+          commit_user_name: ${{ env.GITHUB_USERNAME }}
+          commit_user_email: ${{ env.GITHUB_EMAIL }}
+          tagging_message: v${{ steps.app-release-version.outputs.version }}
+
+      - name: Build Changelog
+        id: build_changelog
+        uses: mikepenz/release-changelog-builder-action@v3
+        with:
+          fromTag: ${{ steps.previos_tag.outputs.previos_tag }}
+          toTag: v${{ steps.app-release-version.outputs.version }}
+          configurationJson: |
+            {
+              "template": "#{{CHANGELOG}}\n\n Comparing changes: [${{steps.previos_tag.outputs.previos_tag}}...v${{ steps.app-release-version.outputs.version }} ](https://github.com/${{github.repository}}/compare/${{steps.previos_tag.outputs.previos_tag}}...v${{ steps.app-release-version.outputs.version }})\n\n**Merged pull requests:**\n\n#{{UNCATEGORIZED}}",
+              "pr_template": "- #{{TITLE}} [#{{AUTHOR}}](https://github.com/#{{AUTHOR}}) #{{URL}}"
+            }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show Changelog
+        run: |
+          echo '${{ steps.build_changelog.outputs.changelog }}'
+
+      # liquibase check
+      - name: Check Liquibase Dependancy File
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        id: liquibase_checkfile
+        run: |
+          if [ -f ./dependencies.json ] && jq 'to_entries[] | select(.key | startswith("liquibase-"))' dependencies.json > /dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "dependencies.json does not exist or Liquibase object does not exist in dependencies.json"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Extract and Combine Liquibase Versions
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        if: steps.liquibase_checkfile.outputs.exists == 'true'
+        id: liquibase_dependency
+        shell: bash
+        run: |
+          result=""
+
+          for key in $(jq -r 'keys[] | select(. == "liquibase" or test("liquibase-"))' dependencies.json); do
+            version=$(jq -r ".\"$key\".version" dependencies.json)
+            result="$result\"$key\": \"$version\","
+          done
+
+          result="{${result%,}}"
+
+          echo "combined_versions=$result" >> $GITHUB_OUTPUT
+          echo Combine Liquibase Versions: $result
+
+      - name: "Create combined release"
+        if: steps.liquibase_checkfile.outputs.exists == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          body: |
+            Liquibase Combined Versions:
+            ${{ steps.liquibase_dependency.outputs.combined_versions }}
+
+            Release Changelog:
+            ${{ steps.build_changelog.outputs.changelog }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ steps.app-release-version.outputs.version }}
+          artifacts: "${{ steps.create_workdir.outputs.path }}/dependencies.json"
+
+      - name: "Create release"
+        if: steps.liquibase_checkfile.outputs.exists == 'false'
+        uses: ncipollo/release-action@v1
+        with:
+          body: ${{ steps.build_changelog.outputs.changelog }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ steps.app-release-version.outputs.version }}
+
+      - name: Run make bump-minor
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        if: startsWith(github.ref, 'refs/heads/main')
+        run: |
+          docker run --rm -t \
+            -v "$(pwd):/build" \
+            -e AWS_DEFAULT_REGION=${{ env.AWS_DEFAULT_REGION }} \
+            -e AWS_ACCESS_KEY_ID=${{ steps.creds.outputs.aws-access-key-id }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ steps.creds.outputs.aws-secret-access-key }} \
+            -e AWS_SESSION_TOKEN=${{ steps.creds.outputs.aws-session-token }} \
+            --entrypoint sh ${{ inputs.python-build-image }} \
+            -c "cd /build && make bump-minor"
+
+      - name: Run make bump-patch
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        if: startsWith(github.ref, 'refs/heads/hotfix/')
+        run: |
+          docker run --rm -t \
+            -v "$(pwd):/build" \
+            -e AWS_DEFAULT_REGION=${{ env.AWS_DEFAULT_REGION }} \
+            -e AWS_ACCESS_KEY_ID=${{ steps.creds.outputs.aws-access-key-id }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ steps.creds.outputs.aws-secret-access-key }} \
+            -e AWS_SESSION_TOKEN=${{ steps.creds.outputs.aws-session-token }} \
+            --entrypoint sh ${{ inputs.python-build-image }} \
+            -c "cd /build && make bump-patch"
+
+      - name: Get current version
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        id: app-version
+        run: echo version=$(cat VERSION) >> $GITHUB_OUTPUT
+
+      - name: Commit and push a new minor version
+        uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          repository: ${{ steps.create_workdir.outputs.path }}
+          commit_message: Version in the VERSION increased to ${{ steps.app-version.outputs.version }}  [skip ci]
+          commit_user_name: ${{ env.GITHUB_USERNAME }}
+          commit_user_email: ${{ env.GITHUB_EMAIL }}
+
+      # Notification channel TRM - Kraken CICD notifications
+      - name: Microsoft Teams Notification
+        uses: skitionek/notify-microsoft-teams@master
+        if: always()
+        with:
+          webhook_url: ${{ secrets.TRM_CP_CICD_MS_TEAMS_WEBHOOK }}
+          needs: ${{ toJson(needs) }}
+          job: ${{ toJson(job) }}
+          steps: ${{ toJson(steps) }}
+          dry_run: false
+          overwrite: "{title: `CD workflow completed for ${{ github.repository }} version ${{ steps.app-release-version.outputs.version }}`}"

@@ -1,0 +1,113 @@
+name: Continious Integrations checks
+
+on:
+  workflow_call:
+    inputs:
+      # Different applications depend on different version of python build image.
+      python-build-image:
+        type: string
+        description: Container name to run make targets.
+        required: true
+
+env:
+  AWS_DEFAULT_REGION: us-east-2
+  GITHUB_USERNAME: trm-build-bot
+  CONTAINER_REGISTRY: ghcr.io
+
+jobs:
+  ci-checks:
+    runs-on: [self-hosted, ec2, devops]
+
+    steps:
+      - name: Change owner
+        run: |
+          sudo chown -R $(id -u):$(id -g) $PWD
+
+      - name: Create unique working directory
+        shell: bash
+        id: create_workdir
+        run: |
+          JOB_WORKDIR="$(pwd)/run_id_${{ github.run_id }}/attempt_${{ github.run_attempt }}/$(echo $RANDOM)"
+          mkdir -p $JOB_WORKDIR
+          echo "path=$JOB_WORKDIR" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          path: "${{ steps.create_workdir.outputs.path }}"
+
+      - name: Login to GitHub Docker registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.CONTAINER_REGISTRY }}
+          username: ${{ env.GITHUB_USERNAME }}
+          password: ${{ secrets.TRM_GITHUB_BOT_TOKEN }}
+
+      # This is a steps in a GitHub Actions workflow, which makes use of Docker and a Makefiles.
+      # docker run --rm -t \ runs a Docker command, creating a new container with the provided specifications.
+      # The --rm flag automatically removes the containers and volumes when it exits.
+      # The -t flag allocates a pseudo-TTY, which can make the output more interactive, as if it's attached to a terminal.
+      # -v "$(pwd):/build" \ is a volume specification that binds the current directory our ($(pwd)) on the host to the /build directory in the container.
+      # This allows workdir to be shared between the host and the container.
+      # The -c "cd /build && make [Target]" is the command run in the container.
+      # This tells the sh shell to navigate (cd) to the /build directory (which should contain your project files due to the volume binding above) and then execute make venv.
+      # The make [Target] command assumes there's a Makefile in your project with a defined targets like this:
+      # https://github.com/vertexinc/trm-df-email-pipeline/blob/main/Makefile
+
+      - name: Configure AWS Credentials
+        id: creds
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: arn:aws:iam::343443274786:role/devops-trm-vcms-service-role-us-east-2
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 3600
+          role-session-name: CiChecksForDf
+          output-credentials: true
+
+      - name: Run make venv
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        run: |
+          docker run --rm -t \
+            -v "$(pwd):/build" \
+            -e AWS_DEFAULT_REGION=${{ env.AWS_DEFAULT_REGION }} \
+            -e AWS_ACCESS_KEY_ID=${{ steps.creds.outputs.aws-access-key-id }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ steps.creds.outputs.aws-secret-access-key }} \
+            -e AWS_SESSION_TOKEN=${{ steps.creds.outputs.aws-session-token }} \
+            --entrypoint sh ${{ inputs.python-build-image }} \
+            -c "cd /build && make venv"
+
+      - name: Run make build
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        run: |
+          docker run --rm -t \
+            -v "$(pwd):/build" \
+            -e AWS_DEFAULT_REGION=${{ env.AWS_DEFAULT_REGION }} \
+            -e AWS_ACCESS_KEY_ID=${{ steps.creds.outputs.aws-access-key-id }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ steps.creds.outputs.aws-secret-access-key }} \
+            -e AWS_SESSION_TOKEN=${{ steps.creds.outputs.aws-session-token }} \
+            --entrypoint sh ${{ inputs.python-build-image }} \
+            -c "cd /build && make build"
+
+      - name: Run make lint
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        run: |
+          docker run --rm -t \
+            -v "$(pwd):/build" \
+            -e AWS_DEFAULT_REGION=${{ env.AWS_DEFAULT_REGION }} \
+            -e AWS_ACCESS_KEY_ID=${{ steps.creds.outputs.aws-access-key-id }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ steps.creds.outputs.aws-secret-access-key }} \
+            -e AWS_SESSION_TOKEN=${{ steps.creds.outputs.aws-session-token }} \
+            --entrypoint sh ${{ inputs.python-build-image }} \
+            -c "cd /build && make lint"
+
+      - name: Run make test
+        working-directory: ${{ steps.create_workdir.outputs.path }}
+        run: |
+          docker run --rm -t \
+            -v "$(pwd):/build" \
+            -e AWS_DEFAULT_REGION=${{ env.AWS_DEFAULT_REGION }} \
+            -e AWS_ACCESS_KEY_ID=${{ steps.creds.outputs.aws-access-key-id }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ steps.creds.outputs.aws-secret-access-key }} \
+            -e AWS_SESSION_TOKEN=${{ steps.creds.outputs.aws-session-token }} \
+            --entrypoint sh ${{ inputs.python-build-image }} \
+            -c "cd /build && make test"
